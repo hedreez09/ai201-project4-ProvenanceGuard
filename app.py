@@ -4,7 +4,8 @@ import re
 import string
 import uuid
 from datetime import datetime, timezone
-
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from groq import Groq
@@ -13,6 +14,12 @@ from groq import Groq
 load_dotenv()
 
 app = Flask(__name__)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 AUDIT_LOG_FILE = "audit_log.json"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -256,17 +263,76 @@ def attribution_from_confidence(confidence):
     return "uncertain"
 
 
-def placeholder_label(attribution):
-    """
-    Temporary Milestone 4 label.
+def generate_transparency_label(attribution):
+    """Return the final reader-facing transparency label."""
+    labels = {
+        "likely_ai": (
+            "Provenance Guard found strong signals that this content may have been "
+            "AI-generated. This label is based on automated analysis and may not be perfect."
+        ),
+        "likely_human": (
+            "Provenance Guard found strong signals that this content appears to be "
+            "human-written. This label is based on automated analysis and should be "
+            "understood as a confidence-based assessment, not absolute proof."
+        ),
+        "uncertain": (
+            "Provenance Guard could not confidently determine whether this content was "
+            "AI-generated or human-written. The result is uncertain, and readers should "
+            "avoid making assumptions based on this label alone."
+        ),
+    }
 
-    Final label text will be implemented in Milestone 5.
+    return labels.get(attribution, labels["uncertain"])
+
+def find_latest_classification(content_id):
+    """Find the latest classification log entry for a content ID."""
+    entries = load_audit_log()
+
+    for entry in reversed(entries):
+        if (
+            entry.get("content_id") == content_id
+            and entry.get("event_type") == "classification"
+        ):
+            return entry
+
+    return None
+
+
+def has_existing_appeal(content_id):
+    """Check whether an appeal has already been filed for a content ID."""
+    entries = load_audit_log()
+
+    return any(
+        entry.get("content_id") == content_id
+        and entry.get("event_type") == "appeal"
+        for entry in entries
+    )
+
+
+def update_classification_status(content_id, new_status):
     """
-    if attribution == "likely_ai":
-        return "Placeholder label: this content shows strong AI-like signals based on the combined detection pipeline."
-    if attribution == "likely_human":
-        return "Placeholder label: this content shows strong human-like signals based on the combined detection pipeline."
-    return "Placeholder label: the system is uncertain based on the combined detection pipeline."
+    Update the latest matching classification entry status in audit_log.json.
+
+    This keeps the log simple for the project while allowing /log to show
+    that the original content is now under review.
+    """
+    entries = load_audit_log()
+    updated = False
+
+    for entry in reversed(entries):
+        if (
+            entry.get("content_id") == content_id
+            and entry.get("event_type") == "classification"
+        ):
+            entry["status"] = new_status
+            updated = True
+            break
+
+    if updated:
+        with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as file:
+            json.dump(entries, file, indent=2)
+
+    return updated
 
 
 @app.route("/", methods=["GET"])
@@ -275,12 +341,13 @@ def home():
         "message": "Provenance Guard API is running.",
         "available_routes": [
             "POST /submit",
+            "POST /appeal",
             "GET /log"
         ]
     })
 
-
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit():
     data = request.get_json(silent=True)
 
@@ -303,7 +370,7 @@ def submit():
 
     confidence = combine_scores(llm_score, stylometric_score)
     attribution = attribution_from_confidence(confidence)
-    label = placeholder_label(attribution)
+    label = generate_transparency_label(attribution)
 
     response_body = {
         "content_id": content_id,
@@ -339,6 +406,55 @@ def submit():
 
     return jsonify(response_body), 200
 
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not content_id or not creator_reasoning:
+        return jsonify({"error": "content_id and creator_reasoning are required"}), 400
+
+    original_decision = find_latest_classification(content_id)
+
+    if not original_decision:
+        return jsonify({"error": "content_id not found"}), 404
+
+    if has_existing_appeal(content_id):
+        return jsonify({"error": "an appeal has already been filed for this content_id"}), 409
+
+    previous_status = original_decision.get("status", "classified")
+    new_status = "under_review"
+
+    update_classification_status(content_id, new_status)
+
+    appeal_entry = {
+        "event_type": "appeal",
+        "content_id": content_id,
+        "creator_id": original_decision.get("creator_id"),
+        "timestamp": get_timestamp(),
+        "appeal_reasoning": creator_reasoning,
+        "original_attribution": original_decision.get("attribution"),
+        "original_confidence": original_decision.get("confidence"),
+        "original_llm_score": original_decision.get("llm_score"),
+        "original_stylometric_score": original_decision.get("stylometric_score"),
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "status": new_status,
+    }
+
+    save_audit_entry(appeal_entry)
+
+    return jsonify({
+        "content_id": content_id,
+        "status": new_status,
+        "message": "Appeal received and content status updated to under review."
+    }), 200
 
 @app.route("/log", methods=["GET"])
 def get_log():
