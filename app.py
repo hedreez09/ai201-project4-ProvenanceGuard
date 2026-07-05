@@ -461,7 +461,7 @@ def get_log():
     entries = load_audit_log()
 
     return jsonify({
-        "entries": entries[-10:]
+        "entries": entries[-25:]
     })
 
 
