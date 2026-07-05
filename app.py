@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import string
 import uuid
 from datetime import datetime, timezone
 
@@ -42,16 +44,23 @@ def save_audit_entry(entry):
         json.dump(entries, file, indent=2)
 
 
+def clamp_score(value):
+    """Keep a score between 0.0 and 1.0."""
+    return max(0.0, min(1.0, float(value)))
+
+
 def classify_with_groq(text):
     """
-    First detection signal.
+    Signal 1: Groq LLM classifier.
 
-    Uses Groq to estimate whether the text appears AI-generated.
-    Returns a score from 0.0 to 1.0, where higher means more likely AI-generated.
+    Returns:
+        {
+            "llm_score": float between 0.0 and 1.0,
+            "llm_reasoning": str
+        }
     """
 
     if not GROQ_API_KEY:
-        # Safe fallback so the app can still run during local setup.
         return {
             "llm_score": 0.5,
             "llm_reasoning": "GROQ_API_KEY is missing. Returned neutral placeholder score."
@@ -98,14 +107,10 @@ Text to analyze:
         )
 
         content = response.choices[0].message.content.strip()
-
         parsed = json.loads(content)
 
-        llm_score = float(parsed.get("llm_score", 0.5))
-        llm_score = max(0.0, min(1.0, llm_score))
-
         return {
-            "llm_score": llm_score,
+            "llm_score": clamp_score(parsed.get("llm_score", 0.5)),
             "llm_reasoning": parsed.get("llm_reasoning", "No reasoning provided.")
         }
 
@@ -116,30 +121,152 @@ Text to analyze:
         }
 
 
-def attribution_from_llm_score(llm_score):
-    """
-    Temporary Milestone 3 attribution using only Signal 1.
+def split_sentences(text):
+    """Split text into basic sentences."""
+    sentences = re.split(r"[.!?]+", text)
+    return [sentence.strip() for sentence in sentences if sentence.strip()]
 
-    Real combined scoring will be added in Milestone 4.
+
+def tokenize_words(text):
+    """Extract lowercase word tokens."""
+    return re.findall(r"\b[a-zA-Z']+\b", text.lower())
+
+
+def calculate_sentence_length_variance(sentences):
+    """Calculate sentence length variance based on word counts."""
+    if len(sentences) < 2:
+        return 0.0
+
+    lengths = [len(tokenize_words(sentence)) for sentence in sentences]
+    mean_length = sum(lengths) / len(lengths)
+    variance = sum((length - mean_length) ** 2 for length in lengths) / len(lengths)
+
+    return round(variance, 3)
+
+
+def calculate_type_token_ratio(words):
+    """Calculate vocabulary diversity."""
+    if not words:
+        return 0.0
+
+    unique_words = set(words)
+    return round(len(unique_words) / len(words), 3)
+
+
+def calculate_punctuation_density(text, words):
+    """Calculate punctuation count divided by word count."""
+    if not words:
+        return 0.0
+
+    punctuation_count = sum(1 for char in text if char in string.punctuation)
+    return round(punctuation_count / len(words), 3)
+
+
+def stylometric_signal(text):
     """
-    if llm_score >= 0.75:
+    Signal 2: Stylometric heuristics.
+
+    Returns:
+        {
+            "stylometric_score": float between 0.0 and 1.0,
+            "metrics": {
+                "sentence_length_variance": float,
+                "type_token_ratio": float,
+                "punctuation_density": float,
+                "word_count": int,
+                "sentence_count": int
+            }
+        }
+
+    Higher score means the structure appears more AI-like.
+    """
+
+    sentences = split_sentences(text)
+    words = tokenize_words(text)
+
+    sentence_length_variance = calculate_sentence_length_variance(sentences)
+    type_token_ratio = calculate_type_token_ratio(words)
+    punctuation_density = calculate_punctuation_density(text, words)
+
+    word_count = len(words)
+    sentence_count = len(sentences)
+
+    # Short text is hard to judge, so keep it near uncertain.
+    if word_count < 30 or sentence_count < 2:
+        stylometric_score = 0.5
+    else:
+        # Lower sentence variance can look more AI-like.
+        if sentence_length_variance < 8:
+            variance_score = 0.75
+        elif sentence_length_variance < 25:
+            variance_score = 0.5
+        else:
+            variance_score = 0.25
+
+        # Very low vocabulary diversity can look more repetitive/AI-like.
+        if type_token_ratio < 0.45:
+            vocabulary_score = 0.75
+        elif type_token_ratio < 0.70:
+            vocabulary_score = 0.5
+        else:
+            vocabulary_score = 0.25
+
+        # Very low punctuation density can look smoother/more uniform.
+        if punctuation_density < 0.03:
+            punctuation_score = 0.65
+        elif punctuation_density < 0.08:
+            punctuation_score = 0.45
+        else:
+            punctuation_score = 0.25
+
+        stylometric_score = (
+            0.4 * variance_score
+            + 0.4 * vocabulary_score
+            + 0.2 * punctuation_score
+        )
+
+    return {
+        "stylometric_score": round(clamp_score(stylometric_score), 3),
+        "metrics": {
+            "sentence_length_variance": sentence_length_variance,
+            "type_token_ratio": type_token_ratio,
+            "punctuation_density": punctuation_density,
+            "word_count": word_count,
+            "sentence_count": sentence_count
+        }
+    }
+
+
+def combine_scores(llm_score, stylometric_score):
+    """
+    Combine both signals using the planning.md weighting.
+
+    combined_score = (0.6 * llm_score) + (0.4 * stylometric_score)
+    """
+    combined_score = (0.6 * llm_score) + (0.4 * stylometric_score)
+    return round(clamp_score(combined_score), 3)
+
+
+def attribution_from_confidence(confidence):
+    """Map combined confidence score to attribution category."""
+    if confidence >= 0.75:
         return "likely_ai"
-    if llm_score <= 0.39:
+    if confidence <= 0.39:
         return "likely_human"
     return "uncertain"
 
 
 def placeholder_label(attribution):
     """
-    Temporary Milestone 3 label.
+    Temporary Milestone 4 label.
 
-    Full final label logic will be added in Milestone 5.
+    Final label text will be implemented in Milestone 5.
     """
     if attribution == "likely_ai":
-        return "Placeholder label: this content shows strong AI-like signals based on the first detection signal."
+        return "Placeholder label: this content shows strong AI-like signals based on the combined detection pipeline."
     if attribution == "likely_human":
-        return "Placeholder label: this content shows strong human-like signals based on the first detection signal."
-    return "Placeholder label: the system is uncertain based on the first detection signal."
+        return "Placeholder label: this content shows strong human-like signals based on the combined detection pipeline."
+    return "Placeholder label: the system is uncertain based on the combined detection pipeline."
 
 
 @app.route("/", methods=["GET"])
@@ -171,12 +298,11 @@ def submit():
     llm_result = classify_with_groq(text)
     llm_score = llm_result["llm_score"]
 
-    attribution = attribution_from_llm_score(llm_score)
+    stylometric_result = stylometric_signal(text)
+    stylometric_score = stylometric_result["stylometric_score"]
 
-    # For Milestone 3, confidence is based only on the first signal.
-    # In Milestone 4, this will become combined confidence from both signals.
-    confidence = llm_score
-
+    confidence = combine_scores(llm_score, stylometric_score)
+    attribution = attribution_from_confidence(confidence)
     label = placeholder_label(attribution)
 
     response_body = {
@@ -188,7 +314,9 @@ def submit():
         "status": "classified",
         "signals": {
             "llm_score": llm_score,
-            "llm_reasoning": llm_result["llm_reasoning"]
+            "llm_reasoning": llm_result["llm_reasoning"],
+            "stylometric_score": stylometric_score,
+            "stylometric_metrics": stylometric_result["metrics"]
         }
     }
 
@@ -201,7 +329,8 @@ def submit():
         "confidence": confidence,
         "llm_score": llm_score,
         "llm_reasoning": llm_result["llm_reasoning"],
-        "stylometric_score": None,
+        "stylometric_score": stylometric_score,
+        "stylometric_metrics": stylometric_result["metrics"],
         "label": label,
         "status": "classified"
     }
